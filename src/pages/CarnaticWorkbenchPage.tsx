@@ -9,6 +9,9 @@ type GraphCardProps = {
   swaraGuides: Array<{ offset: number; label: string; color: string }>;
   showFrequencyDiagram: boolean;
   showPhrasing: boolean;
+  showNotes: boolean;
+  showDynamics: boolean;
+  showTone: boolean;
   canRecord: boolean;
   hasShrutiSet: boolean;
   hasRagamSet: boolean;
@@ -16,14 +19,16 @@ type GraphCardProps = {
   shrutiButtonLabel: string;
   talamButtonLabel: string;
   ragamButtonLabel: string;
+  setupOverlayDismissed: boolean;
   onBpmChange: (value: number) => void;
   onOpenPopup: (kind: "talam" | "ragam" | "shruti") => void;
+  onDismissSetupOverlay: () => void;
   onRecordingStateChange: (isRecording: boolean) => void;
 };
 
 type PageView = "comparison" | "student-focus" | "teacher-focus" | "side-by-side";
 type LayerKey = "layer1" | "layer2" | "layer3" | "layer4" | "layer5";
-type FrequencyPoint = { t: number; hz: number | null };
+type FrequencyPoint = { t: number; hz: number | null; amp: number | null; tone: number | null };
 
 const pageViewOptions: Array<{ value: PageView; label: string }> = [
   { value: "comparison", label: "Comparison" },
@@ -35,9 +40,9 @@ const pageViewOptions: Array<{ value: PageView; label: string }> = [
 const layerOptions: Array<{ key: LayerKey; label: string }> = [
   { key: "layer1", label: "Frequency diagram" },
   { key: "layer2", label: "Phrasing" },
-  { key: "layer3", label: "Layer 3" },
-  { key: "layer4", label: "Layer 4" },
-  { key: "layer5", label: "Layer 5" }
+  { key: "layer3", label: "Notes" },
+  { key: "layer4", label: "Dyanmics" },
+  { key: "layer5", label: "Tone" }
 ];
 
 const PLOT_LEFT_X = 28;
@@ -59,6 +64,7 @@ const SWARA_MAX_OFFSET = 19;
 const TRACE_SEMITONE_SHIFT = -12;
 const PHRASING_MAX_BREATH_GAP_SECONDS = 0.32;
 const PHRASING_SMOOTHING_WINDOW = 9;
+const MAX_FREQUENCY_POINTS = 60000;
 
 const RAGAM_NOTE_OPTIONS = [
   { id: "S", semitone: 0, color: "#92abff" },
@@ -92,6 +98,28 @@ const INCOMPATIBLE_RAGAM_NOTE_PAIRS: Array<[RagamNoteId, RagamNoteId]> = [
 
 const DEFAULT_RAGAM_NOTES: RagamNoteId[] = ["S"];
 
+const RAGAM_PRESETS: Array<{ key: string; name: string; notes: RagamNoteId[] }> = [
+  { key: "shankarabaranam", name: "Shankarabaranam", notes: ["S", "R2", "G3", "M1", "P", "D2", "N3"] },
+  { key: "mayamalavagowla", name: "Mayamalavagowla", notes: ["S", "R1", "G3", "M1", "P", "D1", "N3"] },
+  { key: "nattai", name: "Nattai", notes: ["S", "R3", "G3", "M1", "P", "D3", "N3"] },
+  { key: "kalyani", name: "Kalyani", notes: ["S", "R2", "G3", "M2", "P", "D2", "N3"] }
+];
+
+// Keeps ragam notes in the same canonical order used by the note grid.
+function normalizeRagamNotes(noteIds: RagamNoteId[]): RagamNoteId[] {
+  const selected = new Set<RagamNoteId>(noteIds);
+  return RAGAM_NOTE_OPTIONS.map((note) => note.id).filter((noteId) => selected.has(noteId));
+}
+
+// Resolves a ragam preset from a typed name using case-insensitive matching.
+function findRagamPresetByName(name: string): { key: string; name: string; notes: RagamNoteId[] } | null {
+  const normalized = name.trim().toLowerCase();
+  if (!normalized) {
+    return null;
+  }
+  return RAGAM_PRESETS.find((preset) => preset.name.toLowerCase() === normalized) ?? null;
+}
+
 const SHRUTI_NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"] as const;
 const SHRUTI_MIN_MIDI = 36; // C2
 const SHRUTI_MAX_MIDI = 54; // F#3
@@ -110,12 +138,20 @@ const SHRUTI_OPTIONS: Array<{ label: string; hz: number }> = Array.from(
 const PITCH_MEDIAN_WINDOW = 5;
 const PITCH_STICKY_CENTS = 16;
 const PITCH_OCTAVE_RATIO_TOLERANCE = 0.28;
-const PITCH_OCTAVE_ACCEPT_FRAMES = 3;
-const PITCH_OCTAVE_SWITCH_MIN_SILENCE_FRAMES = 10;
+const PITCH_OCTAVE_ACCEPT_FRAMES = 6;
+const PITCH_OCTAVE_SWITCH_MIN_SILENCE_FRAMES = 8;
 const PITCH_LARGE_JUMP_CENTS = 620;
 const PITCH_JUMP_ALIGNMENT_MIN_IMPROVEMENT_CENTS = 180;
-const PITCH_SILENCE_RELEASE_FRAMES = 12;
+const PITCH_SILENCE_RELEASE_FRAMES = 20;
+const PITCH_BRIEF_HOLD_FRAMES = 0;
+const DRONE_TONE_CENTS_TOLERANCE = 46;
+const DRONE_SUPPRESSION_ALT_DB_WINDOW = 12;
+const DRONE_SUPPRESSION_MIN_ALT_DB = -76;
+const DRONE_REJECT_RMS_THRESHOLD = 0.014;
+const DRONE_SIGNATURE_MIN_DB = -71;
+const DRONE_SIGNATURE_MAX_DB_DELTA = 17;
 
+// Returns absolute pitch distance in cents between two frequencies.
 function absoluteCentsDelta(hzA: number, hzB: number): number {
   if (hzA <= 0 || hzB <= 0) {
     return Infinity;
@@ -123,6 +159,266 @@ function absoluteCentsDelta(hzA: number, hzB: number): number {
   return Math.abs(1200 * Math.log2(hzA / hzB));
 }
 
+// Computes frame RMS to estimate how much voiced energy is present.
+function getFrameRms(samples: Float32Array<ArrayBufferLike>): number {
+  let sum = 0;
+  for (let i = 0; i < samples.length; i += 1) {
+    const v = samples[i];
+    sum += v * v;
+  }
+  return Math.sqrt(sum / Math.max(1, samples.length));
+}
+
+// Finds how close a frequency is to tanpura drone tones (S/P across octaves).
+function centsToNearestDroneTone(hz: number, tonicHz: number): number {
+  if (hz <= 0 || tonicHz <= 0) {
+    return Infinity;
+  }
+
+  // Tanpura reference tones: tonic (S) and fifth (P), across octaves.
+  const droneSemitoneClasses = [0, 7];
+  let best = Infinity;
+  for (const semitoneClass of droneSemitoneClasses) {
+    const baseRatio = 2 ** (semitoneClass / 12);
+    for (let octaveShift = -3; octaveShift <= 3; octaveShift += 1) {
+      const droneHz = tonicHz * baseRatio * 2 ** octaveShift;
+      const cents = absoluteCentsDelta(hz, droneHz);
+      if (cents < best) {
+        best = cents;
+      }
+    }
+  }
+  return best;
+}
+
+// Detects whether a frequency is likely part of the tanpura drone.
+function isDroneLikePitch(hz: number, tonicHz: number): boolean {
+  return centsToNearestDroneTone(hz, tonicHz) <= DRONE_TONE_CENTS_TOLERANCE;
+}
+
+// Finds cents distance to a specific note class (like tonic or fifth) across octaves.
+function centsToNearestNoteClass(hz: number, tonicHz: number, semitoneClass: number): number {
+  if (hz <= 0 || tonicHz <= 0) {
+    return Infinity;
+  }
+
+  let best = Infinity;
+  const baseRatio = 2 ** (semitoneClass / 12);
+  for (let octaveShift = -3; octaveShift <= 3; octaveShift += 1) {
+    const candidateHz = tonicHz * baseRatio * 2 ** octaveShift;
+    const cents = absoluteCentsDelta(hz, candidateHz);
+    if (cents < best) {
+      best = cents;
+    }
+  }
+  return best;
+}
+
+// Detects whether the frame contains a tanpura-like S+P drone signature.
+function hasDroneSignature(
+  freqData: Float32Array<ArrayBufferLike> | null,
+  sampleRate: number,
+  fftSize: number,
+  tonicHz: number
+): boolean {
+  if (!freqData || sampleRate <= 0 || fftSize <= 0 || tonicHz <= 0) {
+    return false;
+  }
+
+  // Require tonic and fifth in the same octave band so voice harmonics
+  // do not get misclassified as an always-on drone.
+  const octaveShifts = [-1, 0, 1, 2];
+  for (const octaveShift of octaveShifts) {
+    const sHz = tonicHz * 2 ** octaveShift;
+    const pHz = tonicHz * 2 ** (octaveShift + 7 / 12);
+    if (sHz < 60 || pHz < 60 || sHz > 900 || pHz > 1300) {
+      continue;
+    }
+
+    const sDb = sampleSpectrumDbAtHz(freqData, sampleRate, fftSize, sHz);
+    const pDb = sampleSpectrumDbAtHz(freqData, sampleRate, fftSize, pHz);
+    if (!Number.isFinite(sDb) || !Number.isFinite(pDb)) {
+      continue;
+    }
+    if (sDb < DRONE_SIGNATURE_MIN_DB || pDb < DRONE_SIGNATURE_MIN_DB) {
+      continue;
+    }
+
+    const balance = Math.abs(sDb - pDb);
+    if (balance <= DRONE_SIGNATURE_MAX_DB_DELTA) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+// Samples approximate dB value of the spectrum at a target frequency.
+function sampleSpectrumDbAtHz(
+  freqData: Float32Array<ArrayBufferLike> | null,
+  sampleRate: number,
+  fftSize: number,
+  hz: number
+): number {
+  if (!freqData || sampleRate <= 0 || fftSize <= 0 || hz <= 0) {
+    return -120;
+  }
+
+  const rawBin = (hz * fftSize) / sampleRate;
+  if (!Number.isFinite(rawBin) || rawBin <= 0) {
+    return -120;
+  }
+
+  const maxBin = freqData.length - 1;
+  const lowBin = Math.max(0, Math.min(maxBin, Math.floor(rawBin)));
+  const highBin = Math.max(0, Math.min(maxBin, lowBin + 1));
+  const weight = Math.max(0, Math.min(1, rawBin - lowBin));
+  const lowDb = Number.isFinite(freqData[lowBin]) ? freqData[lowBin] : -120;
+  const highDb = Number.isFinite(freqData[highBin]) ? freqData[highBin] : -120;
+
+  return lowDb + (highDb - lowDb) * weight;
+}
+
+// Prefers lower-octave S/P candidates when their spectral energy is still strong.
+function preferLowerDroneRegister(
+  detectedHz: number,
+  freqData: Float32Array<ArrayBufferLike> | null,
+  sampleRate: number,
+  fftSize: number,
+  tonicHz: number
+): number {
+  if (!freqData || detectedHz <= 0) {
+    return detectedHz;
+  }
+
+  let bestHz = detectedHz;
+  let bestDb = sampleSpectrumDbAtHz(freqData, sampleRate, fftSize, detectedHz);
+  let candidate = detectedHz;
+
+  for (let step = 0; step < 3; step += 1) {
+    const half = candidate / 2;
+    if (half < 70) {
+      break;
+    }
+    if (!isDroneLikePitch(half, tonicHz)) {
+      candidate = half;
+      continue;
+    }
+
+    const halfDb = sampleSpectrumDbAtHz(freqData, sampleRate, fftSize, half);
+    if (halfDb >= bestDb - 9) {
+      bestHz = half;
+      bestDb = halfDb;
+    }
+    candidate = half;
+  }
+
+  return bestHz;
+}
+
+// Picks a strong non-drone spectral peak when drone tones dominate the frame.
+function pickAlternateNonDronePeakHz(
+  freqData: Float32Array<ArrayBufferLike>,
+  sampleRate: number,
+  fftSize: number,
+  tonicHz: number
+): number | null {
+  const peaks: Array<{ hz: number; db: number; droneLike: boolean }> = [];
+  for (let bin = 2; bin < freqData.length - 1; bin += 1) {
+    const db = freqData[bin];
+    if (!Number.isFinite(db) || db < -92) {
+      continue;
+    }
+    if (db < freqData[bin - 1] || db < freqData[bin + 1]) {
+      continue;
+    }
+    const hz = (bin * sampleRate) / fftSize;
+    if (hz < 70 || hz > 1400) {
+      continue;
+    }
+    peaks.push({ hz, db, droneLike: isDroneLikePitch(hz, tonicHz) });
+  }
+
+  if (peaks.length === 0) {
+    return null;
+  }
+
+  peaks.sort((a, b) => b.db - a.db);
+  const strongest = peaks[0];
+  const strongestNonDrone = peaks.find((peak) => !peak.droneLike);
+  if (!strongestNonDrone) {
+    return null;
+  }
+
+  if (
+    strongest.droneLike &&
+    strongestNonDrone.db >= strongest.db - DRONE_SUPPRESSION_ALT_DB_WINDOW &&
+    strongestNonDrone.db >= DRONE_SUPPRESSION_MIN_ALT_DB
+  ) {
+    return strongestNonDrone.hz;
+  }
+
+  return null;
+}
+
+// Suppresses drone-locked detections and keeps likely singer pitch candidates.
+function suppressDroneLockedPitch(
+  detectedHz: number,
+  freqData: Float32Array<ArrayBufferLike> | null,
+  sampleRate: number,
+  fftSize: number,
+  tonicHz: number,
+  droneSignaturePresent: boolean,
+  frameRms: number,
+  lastStableHz: number | null
+): number | null {
+  if (!isDroneLikePitch(detectedHz, tonicHz)) {
+    return detectedHz;
+  }
+
+  if (!droneSignaturePresent) {
+    return detectedHz;
+  }
+
+  const singerDominantFrame = frameRms >= DRONE_REJECT_RMS_THRESHOLD * 2.8;
+  if (singerDominantFrame) {
+    return detectedHz;
+  }
+
+  const alternateHz =
+    freqData !== null ? pickAlternateNonDronePeakHz(freqData, sampleRate, fftSize, tonicHz) : null;
+  if (alternateHz !== null) {
+    if (lastStableHz === null) {
+      return alternateHz;
+    }
+    const alternateDelta = absoluteCentsDelta(alternateHz, lastStableHz);
+    const detectedDelta = absoluteCentsDelta(detectedHz, lastStableHz);
+    if (alternateDelta + 90 < detectedDelta) {
+      return alternateHz;
+    }
+  }
+
+  const lowerPreferredHz = preferLowerDroneRegister(detectedHz, freqData, sampleRate, fftSize, tonicHz);
+  if (lowerPreferredHz < detectedHz * 0.76) {
+    if (lastStableHz === null) {
+      return lowerPreferredHz;
+    }
+    const lowerDelta = absoluteCentsDelta(lowerPreferredHz, lastStableHz);
+    const detectedDelta = absoluteCentsDelta(detectedHz, lastStableHz);
+    if (lowerDelta + 85 < detectedDelta) {
+      return lowerPreferredHz;
+    }
+  }
+
+  // If we only hear tonic/fifth and the frame is weak, treat as drone-only.
+  if (frameRms < DRONE_REJECT_RMS_THRESHOLD) {
+    return null;
+  }
+
+  return detectedHz;
+}
+
+// Octave-aligns a detected pitch to stay continuous with a reference pitch.
 function alignOctaveToReference(hz: number, referenceHz: number): number {
   if (hz <= 0 || referenceHz <= 0) {
     return hz;
@@ -145,6 +441,7 @@ function alignOctaveToReference(hz: number, referenceHz: number): number {
   return bestHz;
 }
 
+// Detects fundamental frequency from time-domain samples using YIN-style analysis.
 function detectFundamentalHz(samples: Float32Array, sampleRate: number): number | null {
   let mean = 0;
   for (let i = 0; i < samples.length; i += 1) {
@@ -214,16 +511,8 @@ function detectFundamentalHz(samples: Float32Array, sampleRate: number): number 
     return null;
   }
 
-  // Guard against octave-up harmonic locking.
+  // Keep the raw YIN candidate by default to avoid downward octave bias.
   let correctedLag = candidateLag;
-  const doubledLag = candidateLag * 2;
-  if (doubledLag < maxLag) {
-    const currentScore = yin[candidateLag];
-    const doubledScore = yin[doubledLag];
-    if (Number.isFinite(doubledScore) && doubledScore > 0 && doubledScore <= currentScore * 1.25 + 0.004) {
-      correctedLag = doubledLag;
-    }
-  }
 
   const y0 = yin[correctedLag - 1];
   const y1 = yin[correctedLag];
@@ -239,6 +528,7 @@ function detectFundamentalHz(samples: Float32Array, sampleRate: number): number 
   return sampleRate / lagRefined;
 }
 
+// Builds y-axis guide metadata from the selected ragam notes and octave markers.
 function buildSwaraGuides(selectedNotes: RagamNoteId[]): Array<{ offset: number; label: string; color: string }> {
   const selectedSet = new Set<RagamNoteId>(selectedNotes);
   const semitoneMap = new Map<number, { labels: string[]; color: string }>();
@@ -262,9 +552,18 @@ function buildSwaraGuides(selectedNotes: RagamNoteId[]): Array<{ offset: number;
     if (!noteForSemitone) {
       continue;
     }
+
+    const octaveShiftFromMid = Math.floor(offset / 12);
+    let octaveMarker = "";
+    if (octaveShiftFromMid > 0) {
+      octaveMarker = "'".repeat(octaveShiftFromMid);
+    } else if (octaveShiftFromMid < 0) {
+      octaveMarker = "_".repeat(Math.abs(octaveShiftFromMid));
+    }
+
     guides.push({
       offset,
-      label: noteForSemitone.labels.join("/"),
+      label: `${noteForSemitone.labels.join("/")}${octaveMarker}`,
       color: noteForSemitone.color
     });
   }
@@ -272,6 +571,7 @@ function buildSwaraGuides(selectedNotes: RagamNoteId[]): Array<{ offset: number;
   return guides;
 }
 
+// Converts a frequency-over-time series into an SVG path.
 function buildTracePath(series: FrequencyPoint[], tonicHz: number): string {
   if (series.length < 2) {
     return "";
@@ -298,6 +598,251 @@ function buildTracePath(series: FrequencyPoint[], tonicHz: number): string {
     .join(" ");
 }
 
+// Converts a semitone offset to chart y-position in pixels.
+function semitoneOffsetToY(offset: number): number {
+  const normalizedFrequency = (offset - SWARA_MIN_OFFSET) / (SWARA_MAX_OFFSET - SWARA_MIN_OFFSET);
+  const yVirtual = PLOT_BOTTOM_Y - normalizedFrequency * (PLOT_BOTTOM_Y - PLOT_TOP_Y);
+  return yVirtual * Y_UNITS_TO_PX;
+}
+
+// Normalizes RMS to a 0..1 loudness value for dynamics rendering.
+function rmsToNormalizedLoudness(rms: number): number {
+  if (!Number.isFinite(rms) || rms <= 0) {
+    return 0;
+  }
+  const db = 20 * Math.log10(rms);
+  const normalized = (db + 62) / 40;
+  return Math.max(0, Math.min(1, normalized));
+}
+
+// Estimates breathiness from spectral high-frequency energy and flatness.
+function estimateBreathiness(
+  freqData: Float32Array<ArrayBufferLike> | null,
+  sampleRate: number,
+  fftSize: number,
+  frameRms: number
+): number {
+  if (!freqData || !Number.isFinite(sampleRate) || sampleRate <= 0 || fftSize <= 0 || frameRms < 0.006) {
+    return 0;
+  }
+
+  let totalPower = 0;
+  let highBandPower = 0;
+  let flatPowerSum = 0;
+  let flatLogPowerSum = 0;
+  let flatCount = 0;
+
+  for (let bin = 2; bin < freqData.length; bin += 1) {
+    const db = freqData[bin];
+    if (!Number.isFinite(db) || db < -120) {
+      continue;
+    }
+
+    const hz = (bin * sampleRate) / fftSize;
+    if (hz < 120 || hz > 7000) {
+      continue;
+    }
+
+    const power = 10 ** (db / 10);
+    if (!Number.isFinite(power) || power <= 0) {
+      continue;
+    }
+
+    totalPower += power;
+    if (hz >= 2200) {
+      highBandPower += power;
+    }
+    if (hz >= 1000 && hz <= 6000) {
+      flatPowerSum += power;
+      flatLogPowerSum += Math.log(power);
+      flatCount += 1;
+    }
+  }
+
+  if (totalPower <= 1e-12) {
+    return 0;
+  }
+
+  const highRatio = highBandPower / totalPower;
+  let flatness = 0;
+  if (flatCount > 0 && flatPowerSum > 1e-12) {
+    const geometricMean = Math.exp(flatLogPowerSum / flatCount);
+    const arithmeticMean = flatPowerSum / flatCount;
+    flatness = arithmeticMean > 0 ? geometricMean / arithmeticMean : 0;
+  }
+
+  const rawBreathiness = 0.62 * highRatio + 0.38 * flatness;
+  const normalizedBreathiness = Math.max(0, Math.min(1, (rawBreathiness - 0.03) / 0.32));
+  const rmsWeight = Math.max(0, Math.min(1, (frameRms - 0.008) / 0.07));
+
+  return normalizedBreathiness * (0.65 + 0.35 * rmsWeight);
+}
+
+// Finds where the trace crosses note guide lines and returns dot positions.
+function buildNoteHitPoints(
+  series: FrequencyPoint[],
+  tonicHz: number,
+  noteOffsets: number[]
+): Array<{ key: string; x: number; y: number }> {
+  if (series.length < 2 || noteOffsets.length === 0 || tonicHz <= 0) {
+    return [];
+  }
+
+  const sortedOffsets = [...new Set(noteOffsets)].sort((a, b) => a - b);
+  const hits: Array<{ key: string; x: number; y: number }> = [];
+  const lastXByOffset = new Map<number, number>();
+
+  for (let index = 1; index < series.length; index += 1) {
+    const previous = series[index - 1];
+    const current = series[index];
+    if (!previous.hz || !current.hz || previous.hz <= 0 || current.hz <= 0) {
+      continue;
+    }
+
+    const previousOffset = 12 * Math.log2(previous.hz / tonicHz) + TRACE_SEMITONE_SHIFT;
+    const currentOffset = 12 * Math.log2(current.hz / tonicHz) + TRACE_SEMITONE_SHIFT;
+    if (!Number.isFinite(previousOffset) || !Number.isFinite(currentOffset)) {
+      continue;
+    }
+
+    const low = Math.min(previousOffset, currentOffset);
+    const high = Math.max(previousOffset, currentOffset);
+    const span = currentOffset - previousOffset;
+
+    for (const noteOffset of sortedOffsets) {
+      if (noteOffset < low - 0.001 || noteOffset > high + 0.001) {
+        continue;
+      }
+
+      let timeAtHit = current.t;
+      if (Math.abs(span) > 1e-6) {
+        const ratio = (noteOffset - previousOffset) / span;
+        if (ratio < 0 || ratio > 1) {
+          continue;
+        }
+        timeAtHit = previous.t + (current.t - previous.t) * ratio;
+      } else if (Math.abs(currentOffset - noteOffset) > 0.09) {
+        continue;
+      }
+
+      const x = PLOT_LEFT_X + timeAtHit * X_UNITS_PER_SECOND;
+      const priorX = lastXByOffset.get(noteOffset);
+      if (priorX !== undefined && x - priorX < 3) {
+        continue;
+      }
+      lastXByOffset.set(noteOffset, x);
+      hits.push({
+        key: `${noteOffset}-${timeAtHit.toFixed(3)}-${index}`,
+        x,
+        y: semitoneOffsetToY(noteOffset)
+      });
+    }
+  }
+
+  return hits;
+}
+
+// Builds vertical contour lines from trace to x-axis based on loudness.
+function buildDynamicsLines(
+  series: FrequencyPoint[],
+  tonicHz: number
+): Array<{ key: string; x: number; yTop: number; yBottom: number; opacity: number; strokeWidth: number }> {
+  if (series.length < 2 || tonicHz <= 0) {
+    return [];
+  }
+
+  const lines: Array<{ key: string; x: number; yTop: number; yBottom: number; opacity: number; strokeWidth: number }> = [];
+  const yBottom = PLOT_BOTTOM_Y * Y_UNITS_TO_PX;
+  let lastX = -Infinity;
+
+  for (let index = 0; index < series.length; index += 1) {
+    const point = series[index];
+    if (point.hz === null || point.hz <= 0) {
+      continue;
+    }
+
+    const semitoneOffsetFromTonic = 12 * Math.log2(point.hz / tonicHz) + TRACE_SEMITONE_SHIFT;
+    if (!Number.isFinite(semitoneOffsetFromTonic)) {
+      continue;
+    }
+
+    const x = PLOT_LEFT_X + point.t * X_UNITS_PER_SECOND;
+    const yTop = semitoneOffsetToY(semitoneOffsetFromTonic);
+    const loudness = Math.max(0, Math.min(1, point.amp ?? 0));
+
+    // Louder phrases get denser lines, softer phrases get more spacing.
+    const minSpacingPx = 2.2;
+    const maxSpacingPx = 24;
+    const spacing = maxSpacingPx - (maxSpacingPx - minSpacingPx) * loudness;
+    if (x - lastX < spacing) {
+      continue;
+    }
+    lastX = x;
+
+    lines.push({
+      key: `${index}-${x.toFixed(2)}`,
+      x,
+      yTop,
+      yBottom,
+      opacity: 0.1 + loudness * 0.82,
+      strokeWidth: 0.25 + loudness * 3.1
+    });
+  }
+
+  return lines;
+}
+
+// Builds glow points around the trace where breathiness is higher.
+function buildToneHazePoints(
+  series: FrequencyPoint[],
+  tonicHz: number
+): Array<{ key: string; x: number; y: number; radius: number; opacity: number }> {
+  if (series.length < 2 || tonicHz <= 0) {
+    return [];
+  }
+
+  const hazePoints: Array<{ key: string; x: number; y: number; radius: number; opacity: number }> = [];
+  let lastX = -Infinity;
+
+  for (let index = 0; index < series.length; index += 1) {
+    const point = series[index];
+    if (point.hz === null || point.hz <= 0) {
+      continue;
+    }
+
+    const tone = Math.max(0, Math.min(1, point.tone ?? 0));
+    if (tone <= 0.005) {
+      continue;
+    }
+
+    const semitoneOffsetFromTonic = 12 * Math.log2(point.hz / tonicHz) + TRACE_SEMITONE_SHIFT;
+    if (!Number.isFinite(semitoneOffsetFromTonic)) {
+      continue;
+    }
+
+    const x = PLOT_LEFT_X + point.t * X_UNITS_PER_SECOND;
+    const y = semitoneOffsetToY(semitoneOffsetFromTonic);
+
+    // Breathier tone = denser haze and larger glow.
+    const spacing = 7 - tone * 5;
+    if (x - lastX < spacing) {
+      continue;
+    }
+    lastX = x;
+
+    hazePoints.push({
+      key: `${index}-${x.toFixed(2)}`,
+      x,
+      y,
+      radius: 4 + tone * 14,
+      opacity: 0.14 + tone * 0.5
+    });
+  }
+
+  return hazePoints;
+}
+
+// Generates a smoothed phrasing layer and bridges short breath gaps.
 function buildPhrasingSeries(series: FrequencyPoint[]): FrequencyPoint[] {
   if (series.length < 2) {
     return series;
@@ -338,7 +883,13 @@ function buildPhrasingSeries(series: FrequencyPoint[]): FrequencyPoint[] {
     for (let i = gapStart; i <= gapEnd; i += 1) {
       const ratio = (bridged[i].t - leftPoint.t) / (rightPoint.t - leftPoint.t || 1);
       const interpolated = leftHz + (rightHz - leftHz) * Math.min(1, Math.max(0, ratio));
-      bridged[i] = { t: bridged[i].t, hz: interpolated };
+      const leftAmp = leftPoint.amp ?? 0;
+      const rightAmp = rightPoint.amp ?? 0;
+      const interpolatedAmp = leftAmp + (rightAmp - leftAmp) * Math.min(1, Math.max(0, ratio));
+      const leftTone = leftPoint.tone ?? 0;
+      const rightTone = rightPoint.tone ?? 0;
+      const interpolatedTone = leftTone + (rightTone - leftTone) * Math.min(1, Math.max(0, ratio));
+      bridged[i] = { t: bridged[i].t, hz: interpolated, amp: interpolatedAmp, tone: interpolatedTone };
     }
   }
 
@@ -374,7 +925,7 @@ function buildPhrasingSeries(series: FrequencyPoint[]): FrequencyPoint[] {
       }
 
       if (count > 0) {
-        smoothed[i] = { t: bridged[i].t, hz: 2 ** (logSum / count) };
+        smoothed[i] = { t: bridged[i].t, hz: 2 ** (logSum / count), amp: bridged[i].amp, tone: bridged[i].tone };
       }
     }
 
@@ -384,6 +935,7 @@ function buildPhrasingSeries(series: FrequencyPoint[]): FrequencyPoint[] {
   return smoothed;
 }
 
+// Stops and clears any scheduled audio nodes safely.
 function stopScheduledSources(sources: AudioScheduledSourceNode[]) {
   for (const source of sources) {
     try {
@@ -395,6 +947,7 @@ function stopScheduledSources(sources: AudioScheduledSourceNode[]) {
   sources.length = 0;
 }
 
+// Schedules one tanpura-like pluck with harmonics and a short noise transient.
 function scheduleTanpuraStroke(
   audioContext: AudioContext,
   baseHz: number,
@@ -462,6 +1015,7 @@ function scheduleTanpuraStroke(
   sources.push(noiseSource);
 }
 
+// Teacher avatar used in the upper graph card.
 function TeacherLogo() {
   return (
     <svg viewBox="0 0 64 64" aria-hidden="true">
@@ -475,6 +1029,7 @@ function TeacherLogo() {
   );
 }
 
+// Student avatar used in the lower graph card.
 function StudentLogo() {
   return (
     <svg viewBox="0 0 64 64" aria-hidden="true">
@@ -488,6 +1043,7 @@ function StudentLogo() {
   );
 }
 
+// Graph panel component with recording, rendering, and per-layer visualization.
 function GraphCard({
   logo,
   className,
@@ -497,6 +1053,9 @@ function GraphCard({
   swaraGuides,
   showFrequencyDiagram,
   showPhrasing,
+  showNotes,
+  showDynamics,
+  showTone,
   canRecord,
   hasShrutiSet,
   hasRagamSet,
@@ -504,8 +1063,10 @@ function GraphCard({
   shrutiButtonLabel,
   talamButtonLabel,
   ragamButtonLabel,
+  setupOverlayDismissed,
   onBpmChange,
   onOpenPopup,
+  onDismissSetupOverlay,
   onRecordingStateChange
 }: GraphCardProps) {
   const label = logo === "teacher" ? "Teacher channel" : "Student channel";
@@ -516,6 +1077,7 @@ function GraphCard({
   const analysisAudioContextRef = useRef<AudioContext | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
   const analyserDataRef = useRef<Float32Array<ArrayBuffer> | null>(null);
+  const analyserFreqDataRef = useRef<Float32Array<ArrayBuffer> | null>(null);
   const chartWrapRef = useRef<HTMLDivElement | null>(null);
   const chartRef = useRef<SVGSVGElement | null>(null);
   const hasSetInitialVerticalFocusRef = useRef(false);
@@ -529,7 +1091,6 @@ function GraphCard({
   const [recordedAudioUrl, setRecordedAudioUrl] = useState<string | null>(null);
   const [isPlayingBack, setIsPlayingBack] = useState(false);
   const [frequencySeries, setFrequencySeries] = useState<FrequencyPoint[]>([]);
-  const [setupOverlayDismissed, setSetupOverlayDismissed] = useState(false);
   const [chartScrollState, setChartScrollState] = useState({
     left: 0,
     top: 0,
@@ -583,7 +1144,35 @@ function GraphCard({
       }
 
       analyser.getFloatTimeDomainData(analyserData);
-      const detectedHz = detectFundamentalHz(analyserData, audioContext.sampleRate);
+      const frameRms = getFrameRms(analyserData);
+      const loudness = rmsToNormalizedLoudness(frameRms);
+      const freqData = analyserFreqDataRef.current;
+      if (freqData) {
+        analyser.getFloatFrequencyData(freqData);
+      }
+      const droneSignaturePresent = hasDroneSignature(
+        freqData,
+        audioContext.sampleRate,
+        analyser.fftSize,
+        tonicHz
+      );
+      const breathiness = estimateBreathiness(freqData, audioContext.sampleRate, analyser.fftSize, frameRms);
+
+      const rawDetectedHz = detectFundamentalHz(analyserData, audioContext.sampleRate);
+      const lastStableHz = lastStableHzRef.current;
+      const detectedHz =
+        rawDetectedHz !== null
+          ? suppressDroneLockedPitch(
+              rawDetectedHz,
+              freqData,
+              audioContext.sampleRate,
+              analyser.fftSize,
+              tonicHz,
+              droneSignaturePresent,
+              frameRms,
+              lastStableHz
+            )
+          : null;
       let displayHz: number | null = null;
       if (detectedHz !== null) {
         const history = [...pitchHistoryRef.current, detectedHz].slice(-PITCH_MEDIAN_WINDOW);
@@ -591,7 +1180,6 @@ function GraphCard({
         const sorted = [...history].sort((a, b) => a - b);
         displayHz = sorted[Math.floor(sorted.length / 2)];
 
-        const lastStableHz = lastStableHzRef.current;
         if (lastStableHz !== null && displayHz > 0) {
           const continuityAlignedHz = alignOctaveToReference(displayHz, lastStableHz);
           const rawCentsDelta = absoluteCentsDelta(displayHz, lastStableHz);
@@ -599,6 +1187,8 @@ function GraphCard({
 
           if (
             previousSilenceFrames < PITCH_OCTAVE_SWITCH_MIN_SILENCE_FRAMES &&
+            droneSignaturePresent &&
+            isDroneLikePitch(displayHz, tonicHz) &&
             rawCentsDelta >= PITCH_LARGE_JUMP_CENTS &&
             alignedCentsDelta + PITCH_JUMP_ALIGNMENT_MIN_IMPROVEMENT_CENTS < rawCentsDelta
           ) {
@@ -617,30 +1207,40 @@ function GraphCard({
 
             if (looksLikeOctaveFlip) {
               const octaveAlignedHz = ratioLog2 > 0 ? displayHz / 2 : displayHz * 2;
-              if (previousSilenceFrames < PITCH_OCTAVE_SWITCH_MIN_SILENCE_FRAMES) {
-                displayHz = octaveAlignedHz;
+              const shouldUseOctaveGuard = droneSignaturePresent;
+              if (!shouldUseOctaveGuard) {
                 octaveCandidateRef.current = null;
               } else {
-                const direction: 1 | -1 = displayHz > lastStableHz ? 1 : -1;
-                const currentCandidate = octaveCandidateRef.current;
-                const sameDirection = currentCandidate !== null && currentCandidate.direction === direction;
-                const similarPitch =
-                  currentCandidate !== null &&
-                  absoluteCentsDelta(currentCandidate.hz, displayHz) <= 70;
-                if (sameDirection && similarPitch) {
-                  octaveCandidateRef.current = {
-                    hz: displayHz,
-                    direction,
-                    frames: currentCandidate.frames + 1
-                  };
-                } else {
-                  octaveCandidateRef.current = { hz: displayHz, direction, frames: 1 };
-                }
+                const shouldForceFastAlignment =
+                  previousSilenceFrames < PITCH_OCTAVE_SWITCH_MIN_SILENCE_FRAMES &&
+                  droneSignaturePresent &&
+                  isDroneLikePitch(displayHz, tonicHz);
 
-                if ((octaveCandidateRef.current?.frames ?? 0) < PITCH_OCTAVE_ACCEPT_FRAMES) {
+                if (shouldForceFastAlignment) {
                   displayHz = octaveAlignedHz;
-                } else {
                   octaveCandidateRef.current = null;
+                } else {
+                  const direction: 1 | -1 = displayHz > lastStableHz ? 1 : -1;
+                  const currentCandidate = octaveCandidateRef.current;
+                  const sameDirection = currentCandidate !== null && currentCandidate.direction === direction;
+                  const similarPitch =
+                    currentCandidate !== null &&
+                    absoluteCentsDelta(currentCandidate.hz, displayHz) <= 70;
+                  if (sameDirection && similarPitch) {
+                    octaveCandidateRef.current = {
+                      hz: displayHz,
+                      direction,
+                      frames: currentCandidate.frames + 1
+                    };
+                  } else {
+                    octaveCandidateRef.current = { hz: displayHz, direction, frames: 1 };
+                  }
+
+                  if ((octaveCandidateRef.current?.frames ?? 0) < PITCH_OCTAVE_ACCEPT_FRAMES) {
+                    displayHz = octaveAlignedHz;
+                  } else {
+                    octaveCandidateRef.current = null;
+                  }
                 }
               }
             } else {
@@ -650,6 +1250,11 @@ function GraphCard({
         }
       } else {
         pitchHistoryRef.current = [];
+        const holdHz = lastStableHzRef.current;
+        if (holdHz !== null && previousSilenceFrames < PITCH_BRIEF_HOLD_FRAMES) {
+          // Keep short unvoiced dropouts from causing octave re-locks on re-entry.
+          displayHz = holdHz;
+        }
       }
 
       if (displayHz !== null) {
@@ -664,13 +1269,13 @@ function GraphCard({
       }
       const elapsedSeconds = (performance.now() - recordingStartMsRef.current) / 1000;
 
-      setFrequencySeries((prev) => [...prev, { t: elapsedSeconds, hz: displayHz }].slice(-2400));
+      setFrequencySeries((prev) => [...prev, { t: elapsedSeconds, hz: displayHz, amp: displayHz ? loudness : null, tone: displayHz ? breathiness : null }].slice(-MAX_FREQUENCY_POINTS));
     }, 45);
 
     return () => {
       window.clearInterval(intervalId);
     };
-  }, [isRecording]);
+  }, [isRecording, tonicHz]);
 
   useEffect(() => {
     return () => {
@@ -687,22 +1292,27 @@ function GraphCard({
     };
   }, [recordedAudioUrl]);
 
+  // Moves the recording progress indicator backward.
   const handleBack = () => {
     setRecordingProgress((prev) => Math.max(0, prev - 8));
   };
 
+  // Moves the recording progress indicator forward.
   const handleForward = () => {
     setRecordingProgress((prev) => Math.min(100, prev + 8));
   };
 
+  // Jumps the progress indicator to the beginning.
   const handleJumpToStart = () => {
     setRecordingProgress(0);
   };
 
+  // Jumps the progress indicator to the end.
   const handleJumpToEnd = () => {
     setRecordingProgress(100);
   };
 
+  // Starts microphone capture and initializes analysis/recording state.
   const startRecording = async () => {
     if (!recorderSupported || isRecording) {
       return;
@@ -724,6 +1334,9 @@ function GraphCard({
     silenceFramesRef.current = 0;
     octaveCandidateRef.current = null;
     setFrequencySeries([]);
+    if (chartWrapRef.current) {
+      chartWrapRef.current.scrollLeft = 0;
+    }
 
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -744,6 +1357,9 @@ function GraphCard({
       analyserDataRef.current = new Float32Array(
         new ArrayBuffer(analyser.fftSize * Float32Array.BYTES_PER_ELEMENT)
       );
+      analyserFreqDataRef.current = new Float32Array(
+        new ArrayBuffer(analyser.frequencyBinCount * Float32Array.BYTES_PER_ELEMENT)
+      );
 
       recorder.ondataavailable = (event) => {
         if (event.data && event.data.size > 0) {
@@ -761,6 +1377,7 @@ function GraphCard({
         analysisAudioContextRef.current = null;
         analyserRef.current = null;
         analyserDataRef.current = null;
+        analyserFreqDataRef.current = null;
         mediaStreamRef.current = null;
       };
 
@@ -772,6 +1389,7 @@ function GraphCard({
     }
   };
 
+  // Stops microphone recording and finalizes the captured clip.
   const stopRecording = () => {
     const recorder = mediaRecorderRef.current;
     if (!recorder) {
@@ -785,17 +1403,19 @@ function GraphCard({
     setIsRecording(false);
   };
 
+  // Toggles between starting and stopping recording for this card.
   const handleRecordToggle = () => {
     if (isRecording) {
       stopRecording();
       return;
     }
     if (canRecord) {
-      setSetupOverlayDismissed(true);
+      onDismissSetupOverlay();
     }
     void startRecording();
   };
 
+  // Toggles playback of the last recorded clip.
   const handlePlaybackToggle = async () => {
     if (!audioPlaybackRef.current || !recordedAudioUrl) {
       return;
@@ -811,6 +1431,7 @@ function GraphCard({
     setIsPlayingBack(true);
   };
 
+  // Applies BPM edits from the graph-level BPM input.
   const handleBpmInput = (event: ChangeEvent<HTMLInputElement>) => {
     const parsed = Number(event.target.value);
     if (Number.isNaN(parsed)) {
@@ -839,6 +1460,42 @@ function GraphCard({
     () => (showPhrasing ? buildTracePath(phrasingSeries, tonicHz) : ""),
     [showPhrasing, phrasingSeries, tonicHz]
   );
+  const noteHitPoints = useMemo(
+    () => (showNotes ? buildNoteHitPoints(frequencySeries, tonicHz, swaraGuides.map((guide) => guide.offset)) : []),
+    [showNotes, frequencySeries, tonicHz, swaraGuides]
+  );
+  const dynamicsLines = useMemo(
+    () => (showDynamics ? buildDynamicsLines(frequencySeries, tonicHz) : []),
+    [showDynamics, frequencySeries, tonicHz]
+  );
+  const toneHazePoints = useMemo(
+    () => (showTone ? buildToneHazePoints(frequencySeries, tonicHz) : []),
+    [showTone, frequencySeries, tonicHz]
+  );
+  const toneLayerStrength = useMemo(() => {
+    if (!showTone || frequencySeries.length === 0) {
+      return 0;
+    }
+
+    let toneSum = 0;
+    let toneCount = 0;
+    for (const point of frequencySeries) {
+      if (point.hz === null || point.hz <= 0) {
+        continue;
+      }
+      const tone = point.tone ?? 0;
+      if (!Number.isFinite(tone) || tone <= 0) {
+        continue;
+      }
+      toneSum += tone;
+      toneCount += 1;
+    }
+
+    if (toneCount === 0) {
+      return 0;
+    }
+    return Math.max(0, Math.min(1, toneSum / toneCount));
+  }, [showTone, frequencySeries]);
 
   const swaraGuideLines = swaraGuides.map((guide) => {
     const yNormalized = (guide.offset - SWARA_MIN_OFFSET) / (SWARA_MAX_OFFSET - SWARA_MIN_OFFSET);
@@ -846,6 +1503,7 @@ function GraphCard({
     return { offset: guide.offset, y, label: guide.label, color: guide.color };
   });
 
+  // Syncs sticky axis labels with the chart scroll position.
   const handleChartScroll = useCallback((event: UIEvent<HTMLDivElement>) => {
     const target = event.currentTarget;
     setChartScrollState({
@@ -933,10 +1591,26 @@ function GraphCard({
   }, []);
 
   useEffect(() => {
-    if (!canRecord) {
-      setSetupOverlayDismissed(false);
+    if (!isRecording) {
+      return;
     }
-  }, [canRecord]);
+
+    const wrap = chartWrapRef.current;
+    if (!wrap) {
+      return;
+    }
+
+    const currentTraceX =
+      CHART_PADDING_X_PX + PLOT_LEFT_X + latestTimeSeconds * X_UNITS_PER_SECOND;
+    const followOffsetPx = Math.max(90, wrap.clientWidth * 0.45);
+    const targetScrollLeft = Math.max(0, currentTraceX - followOffsetPx);
+    const maxScrollLeft = Math.max(0, wrap.scrollWidth - wrap.clientWidth);
+    const clampedTarget = Math.min(targetScrollLeft, maxScrollLeft);
+
+    if (Math.abs(wrap.scrollLeft - clampedTarget) > 1) {
+      wrap.scrollLeft = clampedTarget;
+    }
+  }, [isRecording, latestTimeSeconds, plotRightX]);
 
   return (
     <section className={`graph-card ${className ?? ""}`}>
@@ -1038,8 +1712,42 @@ function GraphCard({
                 </g>
               );
             })}
+            {showTone &&
+              toneHazePoints.map((point) => (
+                <circle
+                  key={point.key}
+                  cx={point.x}
+                  cy={point.y}
+                  r={point.radius}
+                  className="tone-haze-dot"
+                  style={{ opacity: point.opacity }}
+                />
+              ))}
+            {showTone && frequencyPath && (
+              <path
+                d={frequencyPath}
+                className="tone-trace-haze"
+                style={{ opacity: 0.24 + toneLayerStrength * 0.52 }}
+              />
+            )}
             {showFrequencyDiagram && frequencyPath && <path d={frequencyPath} className="frequency-trace" />}
             {showPhrasing && phrasingPath && <path d={phrasingPath} className="phrasing-trace" />}
+            {showNotes &&
+              noteHitPoints.map((point) => (
+                <circle key={point.key} cx={point.x} cy={point.y} r={3.8} className="notes-dot" />
+              ))}
+            {showDynamics &&
+              dynamicsLines.map((line) => (
+                <line
+                  key={line.key}
+                  x1={line.x}
+                  y1={line.yTop}
+                  x2={line.x}
+                  y2={line.yBottom}
+                  className="dynamics-line"
+                  style={{ opacity: line.opacity, strokeWidth: line.strokeWidth }}
+                />
+              ))}
           </svg>
         </div>
         <div className="axis-overlay" aria-hidden="true">
@@ -1103,7 +1811,7 @@ function GraphCard({
                   <button
                     type="button"
                     className="chart-setup-go"
-                    onClick={() => setSetupOverlayDismissed(true)}
+                    onClick={onDismissSetupOverlay}
                     aria-label="Continue to recording"
                   >
                     &rarr;
@@ -1127,7 +1835,8 @@ function GraphCard({
   );
 }
 
-export default function App() {
+// Main page container that wires popups, shared settings, and both graph cards.
+export default function CarnaticWorkbenchPage() {
   const shellRef = useRef<HTMLElement | null>(null);
   const targetRef = useRef({ x: 0, y: 0 });
   const currentRef = useRef({ x: 0, y: 0 });
@@ -1157,6 +1866,7 @@ export default function App() {
   const [isTalamPlaying, setIsTalamPlaying] = useState(false);
   const [currentBeatIndex, setCurrentBeatIndex] = useState<number | null>(null);
   const [hasTalamSet, setHasTalamSet] = useState(false);
+  const [setupOverlayDismissed, setSetupOverlayDismissed] = useState(false);
   const [layersEnabled, setLayersEnabled] = useState<Record<LayerKey, boolean>>({
     layer1: true,
     layer2: false,
@@ -1175,6 +1885,11 @@ export default function App() {
   const ragamButtonLabel = hasRagamSet ? `Ragam: ${ragamName.trim() || "Selected"}` : "Set Ragam";
   const talamButtonLabel = hasTalamSet ? `Talam: ${talamName.trim() || `${talamBeats} beats`}` : "Set Talam";
 
+  // Hides setup overlay after required selections are complete.
+  const handleDismissSetupOverlay = useCallback(() => {
+    setSetupOverlayDismissed(true);
+  }, []);
+
   useEffect(() => {
     if (!isAnyRecording) {
       return;
@@ -1187,6 +1902,12 @@ export default function App() {
       layer5: false
     });
   }, [isAnyRecording]);
+
+  useEffect(() => {
+    if (!canRecord) {
+      setSetupOverlayDismissed(false);
+    }
+  }, [canRecord]);
 
   useEffect(() => {
     const animate = () => {
@@ -1242,6 +1963,7 @@ export default function App() {
       void talamAudioContextRef.current.resume();
     }
 
+    // Plays one talam step based on the selected beat pattern.
     const playStep = (stepIndex: number) => {
       const level = talamPattern[stepIndex] ?? 0;
       setCurrentBeatIndex(stepIndex);
@@ -1295,6 +2017,7 @@ export default function App() {
     };
   }, []);
 
+  // Updates background motion target from pointer position.
   const handlePointerMove = useCallback((event: PointerEvent<HTMLElement>) => {
     const rect = event.currentTarget.getBoundingClientRect();
     const normalizedX = (event.clientX - rect.left) / rect.width - 0.5;
@@ -1304,22 +2027,27 @@ export default function App() {
     targetRef.current = { x, y };
   }, []);
 
+  // Recenters background motion when pointer leaves the page.
   const handlePointerLeave = useCallback(() => {
     targetRef.current = { x: 0, y: 0 };
   }, []);
 
+  // Changes layout mode (comparison/focus/side-by-side).
   const handlePageViewChange = useCallback((event: ChangeEvent<HTMLSelectElement>) => {
     setPageView(event.target.value as PageView);
   }, []);
 
+  // Tracks teacher-card recording status at the page level.
   const handleTeacherRecordingState = useCallback((isRecording: boolean) => {
     setRecordingByCard((prev) => (prev.teacher === isRecording ? prev : { ...prev, teacher: isRecording }));
   }, []);
 
+  // Tracks student-card recording status at the page level.
   const handleStudentRecordingState = useCallback((isRecording: boolean) => {
     setRecordingByCard((prev) => (prev.student === isRecording ? prev : { ...prev, student: isRecording }));
   }, []);
 
+  // Toggles visual layers while preserving valid combinations.
   const handleLayerToggle = useCallback((layerKey: LayerKey) => {
     setLayersEnabled((prev) => {
       if (isAnyRecording && layerKey !== "layer1") {
@@ -1346,11 +2074,13 @@ export default function App() {
     });
   }, [isAnyRecording]);
 
+  // Normalizes and applies a shared BPM value.
   const handleBpmChange = useCallback((value: number) => {
     const bounded = Math.max(20, Math.min(240, Math.round(value)));
     setBpm(bounded);
   }, []);
 
+  // Plays a single low-S tanpura-style shruti preview.
   const playShrutiPreview = useCallback((baseHz: number) => {
     if (baseHz <= 0 || !Number.isFinite(baseHz)) {
       return;
@@ -1366,21 +2096,17 @@ export default function App() {
       void audioContext.resume();
     }
 
-    const sequenceSemitones = [7, 12, 12, 0];
-    const sequenceStart = audioContext.currentTime + 0.04;
-    const strokeInterval = 0.75;
-    sequenceSemitones.forEach((semitoneOffset, index) => {
-      const strokeHz = baseHz * 2 ** (semitoneOffset / 12);
-      const strokeStart = sequenceStart + index * strokeInterval;
-      scheduleTanpuraStroke(audioContext, strokeHz, strokeStart, shrutiPreviewSourcesRef.current);
-    });
+    const strokeStart = audioContext.currentTime + 0.04;
+    scheduleTanpuraStroke(audioContext, baseHz, strokeStart, shrutiPreviewSourcesRef.current);
   }, []);
 
+  // Closes whichever configuration popup is currently open.
   const handleClosePopup = useCallback(() => {
     setActivePopup(null);
     setIsTalamPlaying(false);
   }, []);
 
+  // Opens a popup and seeds it with the current saved values.
   const handleOpenPopup = useCallback((kind: "talam" | "ragam" | "shruti") => {
     if (kind === "shruti") {
       setPendingShrutiHz(shrutiHz);
@@ -1393,6 +2119,7 @@ export default function App() {
     setActivePopup(kind);
   }, [ragamName, ragamSelectedNotes, shrutiHz, shrutiLabel]);
 
+  // Updates talam beat-count input in the popup.
   const handleTalamBeatChange = useCallback((event: ChangeEvent<HTMLInputElement>) => {
     const parsed = Number(event.target.value);
     if (Number.isNaN(parsed)) {
@@ -1402,6 +2129,7 @@ export default function App() {
     setTalamBeats(bounded);
   }, []);
 
+  // Cycles beat state for one talam step (silent/low/high).
   const toggleTalamBeatState = useCallback((index: number) => {
     setTalamPattern((prev) =>
       prev.map((value, i) => {
@@ -1419,6 +2147,7 @@ export default function App() {
     );
   }, []);
 
+  // Updates talam BPM input in the popup.
   const handleTalamBpmChange = useCallback((event: ChangeEvent<HTMLInputElement>) => {
     const parsed = Number(event.target.value);
     if (Number.isNaN(parsed)) {
@@ -1428,12 +2157,14 @@ export default function App() {
     setTalamBpm(bounded);
   }, []);
 
+  // Saves talam settings and applies BPM to the main controls.
   const handleSetTalam = useCallback(() => {
     setBpm(talamBpm);
     setHasTalamSet(true);
     handleClosePopup();
   }, [handleClosePopup, talamBpm]);
 
+  // Saves selected shruti as the current tonic.
   const handleSetShruti = useCallback(() => {
     setShrutiHz(pendingShrutiHz);
     setShrutiLabel(pendingShrutiLabel);
@@ -1441,6 +2172,21 @@ export default function App() {
     handleClosePopup();
   }, [handleClosePopup, pendingShrutiHz, pendingShrutiLabel]);
 
+  // Updates ragam name and autocompletes notes when a known ragam is selected.
+  const handlePendingRagamNameChange = useCallback((event: ChangeEvent<HTMLInputElement>) => {
+    const nextName = event.target.value;
+    setPendingRagamName(nextName);
+
+    const matchedPreset = findRagamPresetByName(nextName);
+    if (!matchedPreset) {
+      return;
+    }
+
+    setPendingRagamName(matchedPreset.name);
+    setPendingRagamNotes(normalizeRagamNotes(matchedPreset.notes));
+  }, []);
+
+  // Toggles ragam-note selection while enforcing invalid-combo rules.
   const togglePendingRagamNote = useCallback((noteId: RagamNoteId) => {
     setPendingRagamNotes((prev) => {
       if (prev.includes(noteId)) {
@@ -1459,10 +2205,11 @@ export default function App() {
           nextSet.delete(a);
         }
       }
-      return RAGAM_NOTE_OPTIONS.map((note) => note.id).filter((id) => nextSet.has(id));
+      return normalizeRagamNotes(Array.from(nextSet));
     });
   }, []);
 
+  // Saves the configured ragam name and note selection.
   const handleSetRagam = useCallback(() => {
     setRagamSelectedNotes(pendingRagamNotes);
     setRagamName(pendingRagamName.trim());
@@ -1499,6 +2246,9 @@ export default function App() {
                   swaraGuides={swaraGuides}
                   showFrequencyDiagram={layersEnabled.layer1}
                   showPhrasing={layersEnabled.layer2}
+                  showNotes={layersEnabled.layer3}
+                  showDynamics={layersEnabled.layer4}
+                  showTone={layersEnabled.layer5}
                   canRecord={canRecord}
                   hasShrutiSet={hasShrutiSet}
                   hasRagamSet={hasRagamSet}
@@ -1506,8 +2256,10 @@ export default function App() {
                   shrutiButtonLabel={shrutiButtonLabel}
                   talamButtonLabel={talamButtonLabel}
                   ragamButtonLabel={ragamButtonLabel}
+                  setupOverlayDismissed={setupOverlayDismissed}
                   onBpmChange={handleBpmChange}
                   onOpenPopup={handleOpenPopup}
+                  onDismissSetupOverlay={handleDismissSetupOverlay}
                   onRecordingStateChange={handleTeacherRecordingState}
                 />
               )}
@@ -1521,6 +2273,9 @@ export default function App() {
                   swaraGuides={swaraGuides}
                   showFrequencyDiagram={layersEnabled.layer1}
                   showPhrasing={layersEnabled.layer2}
+                  showNotes={layersEnabled.layer3}
+                  showDynamics={layersEnabled.layer4}
+                  showTone={layersEnabled.layer5}
                   canRecord={canRecord}
                   hasShrutiSet={hasShrutiSet}
                   hasRagamSet={hasRagamSet}
@@ -1528,8 +2283,10 @@ export default function App() {
                   shrutiButtonLabel={shrutiButtonLabel}
                   talamButtonLabel={talamButtonLabel}
                   ragamButtonLabel={ragamButtonLabel}
+                  setupOverlayDismissed={setupOverlayDismissed}
                   onBpmChange={handleBpmChange}
                   onOpenPopup={handleOpenPopup}
+                  onDismissSetupOverlay={handleDismissSetupOverlay}
                   onRecordingStateChange={handleStudentRecordingState}
                 />
               )}
@@ -1543,6 +2300,9 @@ export default function App() {
                     swaraGuides={swaraGuides}
                     showFrequencyDiagram={layersEnabled.layer1}
                     showPhrasing={layersEnabled.layer2}
+                    showNotes={layersEnabled.layer3}
+                    showDynamics={layersEnabled.layer4}
+                    showTone={layersEnabled.layer5}
                     canRecord={canRecord}
                     hasShrutiSet={hasShrutiSet}
                     hasRagamSet={hasRagamSet}
@@ -1550,8 +2310,10 @@ export default function App() {
                     shrutiButtonLabel={shrutiButtonLabel}
                     talamButtonLabel={talamButtonLabel}
                     ragamButtonLabel={ragamButtonLabel}
+                    setupOverlayDismissed={setupOverlayDismissed}
                     onBpmChange={handleBpmChange}
                     onOpenPopup={handleOpenPopup}
+                    onDismissSetupOverlay={handleDismissSetupOverlay}
                     onRecordingStateChange={handleTeacherRecordingState}
                   />
                   <GraphCard
@@ -1562,6 +2324,9 @@ export default function App() {
                     swaraGuides={swaraGuides}
                     showFrequencyDiagram={layersEnabled.layer1}
                     showPhrasing={layersEnabled.layer2}
+                    showNotes={layersEnabled.layer3}
+                    showDynamics={layersEnabled.layer4}
+                    showTone={layersEnabled.layer5}
                     canRecord={canRecord}
                     hasShrutiSet={hasShrutiSet}
                     hasRagamSet={hasRagamSet}
@@ -1569,8 +2334,10 @@ export default function App() {
                     shrutiButtonLabel={shrutiButtonLabel}
                     talamButtonLabel={talamButtonLabel}
                     ragamButtonLabel={ragamButtonLabel}
+                    setupOverlayDismissed={setupOverlayDismissed}
                     onBpmChange={handleBpmChange}
                     onOpenPopup={handleOpenPopup}
+                    onDismissSetupOverlay={handleDismissSetupOverlay}
                     onRecordingStateChange={handleStudentRecordingState}
                   />
                 </>
@@ -1613,10 +2380,6 @@ export default function App() {
                 </button>
               ))}
             </div>
-            <div className="settings-divider" aria-hidden="true" />
-            <div className="settings-group-title muted">More options</div>
-            <div className="settings-item placeholder" aria-hidden="true" />
-            <div className="settings-item placeholder" aria-hidden="true" />
           </aside>
         </div>
       </div>
@@ -1727,10 +2490,16 @@ export default function App() {
                         type="text"
                         value={pendingRagamName}
                         maxLength={48}
-                        onChange={(event) => setPendingRagamName(event.target.value)}
+                        onChange={handlePendingRagamNameChange}
+                        list="ragam-name-options"
                         placeholder="Enter name"
                       />
                     </label>
+                    <datalist id="ragam-name-options">
+                      {RAGAM_PRESETS.map((preset) => (
+                        <option key={preset.key} value={preset.name} />
+                      ))}
+                    </datalist>
                     <div className="ragam-grid" role="group" aria-label="Ragam note selection">
                       {RAGAM_NOTE_OPTIONS.map((note) => {
                         const selected = pendingRagamNotes.includes(note.id);

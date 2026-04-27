@@ -469,6 +469,39 @@ h1 {
   filter: drop-shadow(0 0 5px rgba(79, 125, 242, 0.35));
 }
 
+.notes-dot {
+  fill: #ffffff;
+  stroke: rgba(18, 24, 42, 0.35);
+  stroke-width: 0.9;
+  vector-effect: non-scaling-stroke;
+  filter: drop-shadow(0 0 4px rgba(255, 255, 255, 0.52));
+}
+
+.dynamics-line {
+  stroke: #1e5fd0;
+  stroke-linecap: round;
+  vector-effect: non-scaling-stroke;
+}
+
+.tone-trace-haze {
+  fill: none;
+  stroke: rgba(138, 202, 255, 0.95);
+  stroke-width: 11;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  vector-effect: non-scaling-stroke;
+  filter: blur(4px) saturate(130%);
+  pointer-events: none;
+}
+
+.tone-haze-dot {
+  fill: rgba(126, 195, 255, 0.9);
+  stroke: none;
+  filter: blur(6.4px) saturate(132%);
+  mix-blend-mode: normal;
+  pointer-events: none;
+}
+
 .axis-tick-label {
   font-size: 12px;
   fill: #1f2a44;
